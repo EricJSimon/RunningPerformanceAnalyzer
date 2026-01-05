@@ -9,35 +9,39 @@ import android.util.Log
 import android.widget.Toast
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import androidx.compose.runtime.mutableStateListOf
 import com.example.rpa.data.model.MeasurementData
 import com.example.rpa.data.sensor.SensorDataProvider
 import com.example.rpa.domain.model.Algorithm
-import com.example.rpa.domain.processing.EwmaFilterProcessor
-import com.example.rpa.domain.processing.SensorFusionProcessor
+import com.example.rpa.domain.processing.StepDetector
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.sqrt
 
 private const val TAG = "SensorViewModel"
 
 class SensorViewModel(application: Application) : AndroidViewModel(application) {
 
     private val sensorDataProvider = SensorDataProvider(application)
-    private val ewmaProcessor = EwmaFilterProcessor()
-    private val sensorFusionProcessor = SensorFusionProcessor()
+
+    private val stepDetector = StepDetector()
 
     private val _isMeasuring = mutableStateOf(false)
     val isMeasuring: State<Boolean> = _isMeasuring
 
-    private val _armElevation = mutableFloatStateOf(0f)
-    val armElevation: State<Float> = _armElevation
+    private val _currentCadence = mutableFloatStateOf(0f)
+    val currentCadence: State<Float> = _currentCadence
+
+    private val _stepCount = mutableIntStateOf(0)
+    val stepCount: State<Int> = _stepCount
 
     private val _linearAccelerometerData = mutableStateOf(floatArrayOf(0f, 0f, 0f))
     val linearAccelerometerData: State<FloatArray> = _linearAccelerometerData
@@ -45,35 +49,46 @@ class SensorViewModel(application: Application) : AndroidViewModel(application) 
     private val _gyroscopeData = mutableStateOf(floatArrayOf(0f, 0f, 0f))
     val gyroscopeData: State<FloatArray> = _gyroscopeData
 
-    private val _currentAlgorithm = mutableStateOf(Algorithm.EWMA_FILTER)
+    private val _currentAlgorithm = mutableStateOf(Algorithm.CUSTOM_ALGORITHM)
     val currentAlgorithm: State<Algorithm> = _currentAlgorithm
 
-    private val _elevationHistory = mutableStateListOf<Float>()
-    val elevationHistory: List<Float> = _elevationHistory
+    private val _cadenceHistory = mutableStateListOf<Float>()
+    val cadenceHistory: List<Float> = _cadenceHistory
 
     private var sensorJob: Job? = null
     private val measurementHistory = mutableListOf<MeasurementData>()
+
     private var sessionStartTimestamp: Long = 0L
     private var lastTimestamp: Long = 0L
-    private val accReading = FloatArray(3)
+
+    private var latestGyro = floatArrayOf(0f, 0f, 0f)
+    private var latestAcc = floatArrayOf(0f, 0f, 0f)
+
+    private val _lowImpactSteps = mutableStateOf(0)
+    var lowImpactSteps = _lowImpactSteps
+
+    private val _mediumImpactSteps = mutableStateOf(0)
+    var mediumImpactSteps = _mediumImpactSteps
+
+    private val _highImpactSteps = mutableStateOf(0)
+    var highImpactSteps = _highImpactSteps
 
     fun setAlgorithm(algorithm: Algorithm) {
         if (!_isMeasuring.value) {
             _currentAlgorithm.value = algorithm
-            Log.d(TAG,"Algorithm set to: $algorithm")
+            Log.d(TAG, "Algorithm set to: $algorithm")
         } else {
             Log.w(TAG, "Cannot change algorithm while measuring")
         }
     }
 
-
     fun startMeasurement() {
         if (_isMeasuring.value) {
-            Log.w(TAG,"startMeasurement called but already measuring.")
+            Log.w(TAG, "startMeasurement called but already measuring.")
             return
         }
         _isMeasuring.value = true
-        Log.i(TAG, "Starting measurement with algorithm: ${_currentAlgorithm.value}")
+        Log.i(TAG, "Starting measurement.")
 
         resetAllState()
 
@@ -84,10 +99,10 @@ class SensorViewModel(application: Application) : AndroidViewModel(application) 
 
     fun stopMeasurement() {
         if (!this._isMeasuring.value) {
-            Log.w(TAG,"stopMeasurement called but not measuring.")
+            Log.w(TAG, "stopMeasurement called but not measuring.")
             return
         }
-            _isMeasuring.value = false
+        _isMeasuring.value = false
         Log.i(TAG, "Stopping measurement.")
         sensorJob?.cancel()
         sensorJob = null
@@ -95,7 +110,6 @@ class SensorViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun processSensorEvent(event: SensorEvent) {
         if (sessionStartTimestamp == 0L) {
-            Log.d(TAG, "First sensor event received. Type ${event.sensor.name} Setting start timestamps.")
             sessionStartTimestamp = event.timestamp
             lastTimestamp = event.timestamp
             return
@@ -104,59 +118,110 @@ class SensorViewModel(application: Application) : AndroidViewModel(application) 
         val relativeTimestamp = event.timestamp - sessionStartTimestamp
 
         when (event.sensor.type) {
-            Sensor.TYPE_GRAVITY -> {
-                val newAngle = ewmaProcessor.calculate(event.values[1], event.values[2])
-                Log.v(TAG, "EWMA Calculated Angle: $newAngle")
-                _armElevation.floatValue = newAngle
-                addMeasurementToHistory(relativeTimestamp, newAngle, "EWMA")
+            Sensor.TYPE_STEP_DETECTOR -> {
+                if (_currentAlgorithm.value == Algorithm.HARDWARE_STEP_DETECTOR) {
+                    handleStepDetected(event.timestamp, relativeTimestamp, "Hardware")
+                }
             }
 
             Sensor.TYPE_ACCELEROMETER, Sensor.TYPE_LINEAR_ACCELERATION -> {
                 _linearAccelerometerData.value = event.values.clone()
+                System.arraycopy(event.values, 0, latestAcc, 0, 3)
 
-                if(event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
-                    System.arraycopy(event.values,0,accReading,0,3)
+                val magnitude = sqrt(
+                    latestAcc[0] * latestAcc[0] +
+                            latestAcc[1] * latestAcc[1] +
+                            latestAcc[2] * latestAcc[2]
+                )
+
+                if (_currentAlgorithm.value == Algorithm.CUSTOM_ALGORITHM) {
+                    val stepForce = stepDetector.detectStep(latestAcc, latestGyro, event.timestamp)
+
+                    if (stepForce > 0f) {
+                        handleStepDetected(event.timestamp, relativeTimestamp, "Custom")
+
+                        when {
+                            stepForce < 13.0f -> {
+                                lowImpactSteps.value++
+                                Log.d(TAG, "Impact: LOW ($stepForce)")
+                            }
+
+                            stepForce < 16.0f -> {
+                                mediumImpactSteps.value++
+                                Log.d(TAG, "Impact: MEDIUM ($stepForce)")
+                            }
+
+                            else -> {
+                                highImpactSteps.value++
+                                Log.d(TAG, "Impact: HIGH ($stepForce)")
+                            }
+                        }
+
+                        addMeasurementToHistory(
+                            relativeTimestamp,
+                            magnitude,
+                            "Step (Force: $stepForce)"
+                        )
+                    } else {
+                        addMeasurementToHistory(relativeTimestamp, magnitude, "Raw")
+                    }
+                } else {
+                    addMeasurementToHistory(relativeTimestamp, magnitude, "Raw")
                 }
             }
 
             Sensor.TYPE_GYROSCOPE -> {
-                val dt = (event.timestamp - lastTimestamp) * 1.0f / 1_000_000_000.0f
-
-                if (dt > 0) {
-                    val newAngle = sensorFusionProcessor.calculate(
-                        accY = accReading[1],
-                        accZ = accReading[2],
-                        gyroRate = event.values[0],
-                        dt = dt
-                    )
-                    _armElevation.floatValue = newAngle
-                    Log.v(TAG,"Fusion Calculated Angle: $newAngle, dt: $dt")
-                    addMeasurementToHistory(relativeTimestamp, newAngle, "Sensor Fusion")
-                } else {
-                    Log.w(TAG, "Gyroscope event skipped due to non-positive dt: $dt")
-                }
-                lastTimestamp = event.timestamp
                 _gyroscopeData.value = event.values.clone()
+                System.arraycopy(event.values, 0, latestGyro, 0, 3)
             }
         }
     }
 
-    private fun addMeasurementToHistory(timestamp: Long,value: Float, algorithmName: String) {
-        measurementHistory.add(MeasurementData(timestamp,value,algorithmName))
-        _elevationHistory.add(value)
+    private fun handleStepDetected(eventTimestamp: Long, relativeTimestamp: Long, source: String) {
+        Log.i(TAG, "$source Step Detected! Count: ${_stepCount.intValue + 1}")
+
+        _stepCount.intValue += 1
+
+        val timeDiffSec = (eventTimestamp - lastTimestamp) / 1_000_000_000f
+
+        if (timeDiffSec > 0.25f) {
+            val spm = 60f / timeDiffSec
+            Log.d(TAG, "Calculated SPM: $spm")
+
+            val current = _currentCadence.floatValue
+            _currentCadence.floatValue = if (current == 0f) spm else (current * 0.5f) + (spm * 0.5f)
+
+            lastTimestamp = eventTimestamp
+        }
+    }
+
+    private fun addMeasurementToHistory(timestamp: Long, value: Float, label: String) {
+        measurementHistory.add(MeasurementData(timestamp, value, label))
+
+        if (_cadenceHistory.size < 200) {
+            _cadenceHistory.add(value)
+        } else {
+            _cadenceHistory.removeAt(0)
+            _cadenceHistory.add(value)
+        }
+
+        if (_cadenceHistory.size % 100 == 0) {
+            Log.v(TAG, "Graph history updated. Current val: $value")
+        }
     }
 
     private fun resetAllState() {
         Log.d(TAG, "Resetting all states.")
-        _elevationHistory.clear()
+        _cadenceHistory.clear()
         measurementHistory.clear()
         sessionStartTimestamp = 0L
         lastTimestamp = 0L
-        ewmaProcessor.reset()
-        sensorFusionProcessor.reset()
+
+        stepDetector.reset()
+        _stepCount.intValue = 0
+
         resetUiState()
     }
-
 
     fun exportDataToCsv() {
         Log.d(TAG, "Exporting data to CSV. ${measurementHistory.size} records.")
@@ -167,13 +232,12 @@ class SensorViewModel(application: Application) : AndroidViewModel(application) 
 
         val delimiter = ";"
         val csvHeader =
-            "Timestamp (HH:mm:ss.ms)${delimiter}Arm Elevation (degrees)${delimiter}Algorithm: ${_currentAlgorithm.value}\n"
+            "Timestamp (HH:mm:ss.ms)${delimiter}Value (Mag/Cadence)${delimiter}Metric Type\n"
 
         val csvData = measurementHistory.joinToString(separator = "\n") { dataPoint ->
             val formattedTime = formatNanosToTimeString(dataPoint.timestamp)
             val formattedValue =
                 String.format(Locale.forLanguageTag("sv-SE"), "%.4f", dataPoint.value)
-
             "$formattedTime$delimiter$formattedValue"
         }
         val fullCsv = csvHeader + csvData
@@ -183,9 +247,9 @@ class SensorViewModel(application: Application) : AndroidViewModel(application) 
 
         val resolver = getApplication<Application>().contentResolver
         val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "ArmElevationData_$currentDateTimeString.csv")
+            put(MediaStore.MediaColumns.DISPLAY_NAME, "RunningData_$currentDateTimeString.csv")
             put(MediaStore.MediaColumns.MIME_TYPE, "text/csv")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/SensorApp")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/RunningPerformance")
         }
 
         val uri = resolver.insert(MediaStore.Files.getContentUri("external"), contentValues)
@@ -197,14 +261,14 @@ class SensorViewModel(application: Application) : AndroidViewModel(application) 
                         outputStream.write(fullCsv.toByteArray(Charsets.UTF_8))
                         Toast.makeText(
                             getApplication(),
-                            "Data exported to Downloads/SensorApp",
+                            "Data exported to Downloads/RunningPerformance",
                             Toast.LENGTH_LONG
                         ).show()
-                        Log.i(TAG,"CSV export successful to $uri")
+                        Log.i(TAG, "CSV export successful to $uri")
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG,"Error exporting file",e)
+                Log.e(TAG, "Error exporting file", e)
                 Toast.makeText(
                     getApplication(),
                     "Error exporting file ${e.message}",
@@ -212,7 +276,7 @@ class SensorViewModel(application: Application) : AndroidViewModel(application) 
                 ).show()
             }
         } else {
-            Log.e(TAG,"Error creating file URI for CSV.")
+            Log.e(TAG, "Error creating file URI for CSV.")
             Toast.makeText(getApplication(), "Error creating file URI.", Toast.LENGTH_LONG).show()
         }
         measurementHistory.clear()
@@ -226,18 +290,11 @@ class SensorViewModel(application: Application) : AndroidViewModel(application) 
         val seconds = (totalMillis % (1000 * 60)) / 1000
         val millis = totalMillis % 1000
 
-        return String.format(
-            Locale.US,
-            "%02d:%02d:%02d.%03d",
-            hours,
-            minutes,
-            seconds,
-            millis
-        )
+        return String.format(Locale.US, "%02d:%02d:%02d.%03d", hours, minutes, seconds, millis)
     }
 
     private fun resetUiState() {
-        _armElevation.floatValue = 0f
+        _currentCadence.floatValue = 0f
         _linearAccelerometerData.value = floatArrayOf(0f, 0f, 0f)
         _gyroscopeData.value = floatArrayOf(0f, 0f, 0f)
     }
