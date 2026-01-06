@@ -10,7 +10,6 @@ import com.example.rpa.domain.model.Algorithm
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.launch
 
 private const val TAG = "SensorDataProvider"
 

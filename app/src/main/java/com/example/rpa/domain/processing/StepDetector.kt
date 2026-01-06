@@ -34,8 +34,6 @@ class StepDetector {
         if (rawMagnitude > 10.0f) {
             Log.d(TAG, "Peak Check -> RawMag: %.2f, SmoothMag: %.2f, Gyro: %.2f, Dynamic: $isDynamicMotion".format(rawMagnitude, smoothedMagnitude, gyroMagnitude))
         }
-
-        //var isStep = false
         if (isDynamicMotion && smoothedMagnitude > STEP_THRESHOLD && lastMagnitude <= STEP_THRESHOLD && (timestampNs - lastStepTimeNs) > MIN_TIME_BETWEEN_STEPS_NS) {
             lastStepTimeNs = timestampNs
             stepMagnitude = smoothedMagnitude

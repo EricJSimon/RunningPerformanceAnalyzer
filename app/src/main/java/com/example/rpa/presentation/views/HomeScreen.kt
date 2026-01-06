@@ -119,11 +119,13 @@ fun HomeScreen(
         )
         Spacer(modifier = Modifier.height(8.dp))
 
+        // We check if history is not empty to display the graph
         if (strideHistory.isNotEmpty()) {
             Card(
                 modifier = Modifier.fillMaxWidth().height(250.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.White)
             ) {
+                // The graph composable handles the AndroidView updates
                 StridePatternGraph(dataPoints = strideHistory)
             }
         } else {
@@ -167,7 +169,7 @@ fun HomeScreen(
                         Spacer(modifier = Modifier.height(4.dp))
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text("Soft: $lowImpactCount", color = Color(0xFF4CAF50), style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
-                            Text("Med: $mediumImpactCount", color = Color(0xFFFFA000), style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold) // Darker yellow for text
+                            Text("Med: $mediumImpactCount", color = Color(0xFFFFA000), style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
                             Text("Hard: $highImpactCount", color = Color(0xFFF44336), style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
                         }
                     } else {
